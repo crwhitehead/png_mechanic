@@ -1,6 +1,6 @@
 /*
 
-g++ png_mechanic.cpp -o png_mechanic -lz
+g++ png_mechanic.cpp -o png_mechanic
 
 */
 
@@ -15,6 +15,40 @@ g++ png_mechanic.cpp -o png_mechanic -lz
 #include <map>
 
 #undef DEBUG_CRC_INPUT
+#undef DEBUG_INFLATE
+#undef DEBUG_FILTERS
+#define DEBUG_PACKET_LOCATIONS 1
+
+
+struct extractedByte {
+    uint8_t value;
+    int32_t reference;
+    bool found;
+    bool testing;
+};
+
+
+struct PNGChunk {
+    uint32_t length;
+    char type[5];
+    std::vector<uint8_t> data;
+    uint32_t crc;
+    uint32_t computed_crc;
+};
+
+struct PNGImage {
+    uint32_t width;
+    uint32_t height;
+    uint8_t bit_depth;
+    uint8_t color_type;
+    uint8_t compression_method;
+    uint8_t filter_method;
+    uint8_t interlace_method;
+    std::vector<PNGChunk> chunks;
+    std::vector<uint8_t> image_data;
+    std::vector<uint8_t> decompressed_data;
+    std::vector<uint8_t> pixels;
+};
 
 class Bitstream {
 public:
@@ -24,13 +58,17 @@ public:
         uint32_t value = 0;
         for (size_t i = 0; i < count; ++i) {
             if (bit_pos >= data.size() * 8) {
-                std::cerr << "Error: Attempt to read past end of bitstream" << std::endl;
-                exit(1);
+                //std::cerr << "Error: Attempt to read past end of bitstream" << std::endl;
+            } else {
+                value |= (get_bit(bit_pos) << i);
+                bit_pos++;
             }
-            value |= (get_bit(bit_pos) << i);
-            bit_pos++;
         }
         return value;
+    }
+
+    void set_pos(size_t pos){
+        bit_pos = pos;
     }
 
     void byte_align() {
@@ -45,6 +83,35 @@ public:
         //std::cout << "At byte " << std::hex << (int) data[bit_pos / 8] << std::dec << std::endl;
         return (data[bit_pos / 8] >> ((bit_pos % 8))) & 1;
     }
+    bool finished() {
+        //std::cout << "Reading from " << bit_pos << std::endl;
+        //std::cout << "At byte " << std::hex << (int) data[bit_pos / 8] << std::dec << std::endl;
+        return bit_pos >= data.size() * 8;
+    }
+};
+    
+bool verifyLengths(const std::vector<uint16_t>& lengths){
+    unsigned long total = 0;
+    for (auto len : lengths) {
+        if (len > 0) {
+            total += 1 << (20-len);
+        }
+    }
+    //printf("%p\n", total);
+    return total == 0x100000;
+}
+
+
+struct DeflatePacket {
+    size_t start_position;
+    size_t header_start;
+    size_t data_start;
+    size_t end_position;
+    size_t block_type;
+    bool last;
+    Bitstream* bitstream;
+    
+    DeflatePacket() = default;
 };
 
 struct HuffmanTable {
@@ -94,10 +161,144 @@ struct HuffmanTable {
             }
             code <<= 1;
         }
-        std::cerr << "Error: Invalid Huffman code" << std::endl;
-        exit(1);
+        throw std::runtime_error("Invalid Huffman code");
     }
 };
+
+HuffmanTable load_code_lengths(Bitstream* bitstream, uint16_t hclen){
+    std::vector<uint16_t> code_length_order = {16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15};
+    std::vector<uint16_t> code_lengths(19, 0);
+    for (size_t i = 0; i < hclen; ++i) {
+        code_lengths[code_length_order[i]] = bitstream->read_bits(3);
+    }
+
+    HuffmanTable code_length_table(code_lengths);
+    return code_length_table;
+}
+HuffmanTable load_literal_lengths(Bitstream& bitstream, const HuffmanTable* code_length_table, uint16_t hlit){
+    std::vector<uint16_t> literal_lengths;
+
+    while (literal_lengths.size() < hlit) {
+        uint16_t symbol = code_length_table->decode(bitstream);
+        if (symbol < 16) {
+            literal_lengths.push_back(symbol);
+        } else if (symbol == 16 && literal_lengths.size() > 0) {
+            uint16_t repeat = bitstream.read_bits(2) + 3;
+            literal_lengths.insert(literal_lengths.end(), repeat, literal_lengths.back());
+        } else if (symbol == 17) {
+            uint16_t repeat = bitstream.read_bits(3) + 3;
+            literal_lengths.insert(literal_lengths.end(), repeat, 0);
+        } else if (symbol == 18) {
+            uint16_t repeat = bitstream.read_bits(7) + 11;
+            literal_lengths.insert(literal_lengths.end(), repeat, 0);
+        }
+    }
+    HuffmanTable literal_table(literal_lengths);
+    return literal_table;
+}
+HuffmanTable load_distance_lengths(Bitstream& bitstream, const HuffmanTable* code_length_table, uint16_t hdist){
+    std::vector<uint16_t> distance_lengths;
+    while (distance_lengths.size() < hdist) {
+        uint16_t symbol = code_length_table->decode(bitstream);
+        if (symbol < 16) {
+            distance_lengths.push_back(symbol);
+        } else if (symbol == 16 && distance_lengths.size() > 0) {
+            uint16_t repeat = bitstream.read_bits(2) + 3;
+            distance_lengths.insert(distance_lengths.end(), repeat, distance_lengths.back());
+        } else if (symbol == 17) {
+            uint16_t repeat = bitstream.read_bits(3) + 3;
+            distance_lengths.insert(distance_lengths.end(), repeat, 0);
+        } else if (symbol == 18) {
+            uint16_t repeat = bitstream.read_bits(7) + 11;
+            distance_lengths.insert(distance_lengths.end(), repeat, 0);
+        }
+    }
+    HuffmanTable distance_table(distance_lengths);
+    return distance_table;
+}
+
+std::vector<DeflatePacket> header_scan(const std::vector<uint8_t>& compressed_data){
+        // Read and verify zlib header
+    // Process compressed data blocks
+    Bitstream bitstream(compressed_data);
+    std::vector<DeflatePacket> packets;
+    
+    for(size_t i=0; i<compressed_data.size()*8; i++){
+        bitstream.set_pos(i);
+        DeflatePacket test_packet;
+        test_packet.start_position = i;
+        test_packet.last = 1 == bitstream.read_bits(1);
+        test_packet.block_type = bitstream.read_bits(2);
+        test_packet.header_start = bitstream.bit_pos;
+        if (test_packet.block_type == 2) {
+            // Dynamic Huffman block
+            uint16_t hlit = bitstream.read_bits(5) + 257;
+            uint16_t hdist = bitstream.read_bits(5) + 1;
+            uint16_t hclen = bitstream.read_bits(4) + 4;
+            HuffmanTable code_length_table = load_code_lengths(&bitstream, hclen);
+            if(!verifyLengths(code_length_table.lengths)){
+                //std::cout << "Bad lengths in code length!" << std::endl;
+                continue;
+            }
+            HuffmanTable literal_table = load_literal_lengths(bitstream, &code_length_table, hlit);
+            HuffmanTable distance_table = load_distance_lengths(bitstream,&code_length_table, hdist);
+            /*
+            Time to check if we have a valid huffman tree!
+            */
+            if(!verifyLengths(literal_table.lengths) || !verifyLengths(distance_table.lengths)){
+                //std::cout << "Bad lengths!" << std::endl;
+                continue;
+            }
+            test_packet.data_start = bitstream.bit_pos;
+
+            /*
+            Now read til the end...
+            */
+            bool safe_end = false;
+            while (true) {
+                if(bitstream.finished()){
+                    break;
+                }
+                uint16_t symbol = literal_table.decode(bitstream);
+                if (symbol < 256) {
+                } else if (symbol == 256) {
+                    safe_end = true;
+                    break;
+                } else {
+                    uint16_t length = 0;
+                    if (symbol <= 264) length = symbol - 257 + 3;
+                    else if (symbol <= 284) {
+                        uint32_t extra_bits = (symbol - 261) / 4;
+                        if (symbol < 261){
+                            extra_bits = 0;
+                        }
+                        bitstream.read_bits(extra_bits);
+                    } else if (symbol == 285) length = 258;
+
+                    uint16_t dist_symbol = distance_table.decode(bitstream);
+
+                    if (dist_symbol <= 3) {
+                    } else {
+                        // Calculate the number of extra bits
+                        uint32_t extra_bits = (dist_symbol - 2) / 2;
+                        // Use base distance and extra bits to calculate the distance
+                        bitstream.read_bits(extra_bits);
+                    }
+                }
+            }
+            test_packet.end_position = bitstream.bit_pos;
+            test_packet.bitstream = 0;
+            if(safe_end){
+                packets.push_back(test_packet);
+            }
+        } else {
+            continue;
+        }
+    }
+
+    return packets;
+}
+
 
 std::vector<uint8_t> custom_inflate(const std::vector<uint8_t>& compressed_data) {
 
@@ -132,7 +333,12 @@ std::vector<uint8_t> custom_inflate(const std::vector<uint8_t>& compressed_data)
         last_block = bitstream.read_bits(1);
         uint32_t block_type = bitstream.read_bits(2);
 
-        std::cerr << "Block type: " << block_type << std::endl;
+        #ifdef DEBUG_INFLATE
+        std::cerr << "Block type " << block_type << std::endl;
+        #endif
+        #ifdef DEBUG_PACKET_LOCATIONS
+        std::cout << "Packet: " << std::hex << bitstream.bit_pos - 3 << std::dec << ", type " << block_type << ", end " << last_block << std::endl;
+        #endif
         if (block_type == 0) {
             // Uncompressed block (not implemented in this example)
             throw std::runtime_error("Uncompressed blocks are not supported in this example");
@@ -154,12 +360,12 @@ std::vector<uint8_t> custom_inflate(const std::vector<uint8_t>& compressed_data)
             HuffmanTable code_length_table(code_lengths);
             std::vector<uint16_t> literal_lengths;
             std::vector<uint16_t> distance_lengths;
-
+            
             while (literal_lengths.size() < hlit) {
                 uint16_t symbol = code_length_table.decode(bitstream);
                 if (symbol < 16) {
                     literal_lengths.push_back(symbol);
-                } else if (symbol == 16) {
+                } else if (symbol == 16 && literal_lengths.size() > 0) {
                     uint16_t repeat = bitstream.read_bits(2) + 3;
                     literal_lengths.insert(literal_lengths.end(), repeat, literal_lengths.back());
                 } else if (symbol == 17) {
@@ -175,7 +381,7 @@ std::vector<uint8_t> custom_inflate(const std::vector<uint8_t>& compressed_data)
                 uint16_t symbol = code_length_table.decode(bitstream);
                 if (symbol < 16) {
                     distance_lengths.push_back(symbol);
-                } else if (symbol == 16) {
+                } else if (symbol == 16 && distance_lengths.size() > 0) {
                     uint16_t repeat = bitstream.read_bits(2) + 3;
                     distance_lengths.insert(distance_lengths.end(), repeat, distance_lengths.back());
                 } else if (symbol == 17) {
@@ -187,17 +393,26 @@ std::vector<uint8_t> custom_inflate(const std::vector<uint8_t>& compressed_data)
                 }
             }
 
+
+            //verifyLengths(code_lengths);
+            //verifyLengths(literal_lengths);
+            //verifyLengths(distance_lengths);
             HuffmanTable literal_table(literal_lengths);
             HuffmanTable distance_table(distance_lengths);
-
             while (true) {
                 uint16_t symbol = literal_table.decode(bitstream);
+                #ifdef DEBUG_INFLATE
                 std::cout << "Symbol " << std::hex << (int) symbol << std::dec << std::endl;
+                #endif
                 if (symbol < 256) {
+                    #ifdef DEBUG_INFLATE
                     std::cout << "Hit literal " << std::hex << (int) symbol << std::dec << std::endl;
+                    #endif
                     decompressed_data.push_back(static_cast<uint8_t>(symbol));
                 } else if (symbol == 256) {
+                    #ifdef DEBUG_INFLATE
                     std::cout << "Hit end of block symbol!" << std::endl;
+                    #endif
                     break;
                 } else {
                     uint16_t length = 0;
@@ -215,7 +430,9 @@ std::vector<uint8_t> custom_inflate(const std::vector<uint8_t>& compressed_data)
                         }
                         uint32_t base_length = length_base[symbol - 257];
                         length = base_length + bitstream.read_bits(extra_bits);
+                        #ifdef DEBUG_INFLATE
                         std::cout << "Reading extra bits "  << (int) extra_bits << " with length base " << (int) base_length << std::endl;
+                        #endif
 
                     } else if (symbol == 285) length = 258;
 
@@ -228,7 +445,9 @@ std::vector<uint8_t> custom_inflate(const std::vector<uint8_t>& compressed_data)
                     };
 
                     uint16_t dist_symbol = distance_table.decode(bitstream);
+                    #ifdef DEBUG_INFLATE
                     std::cout << "Distance symbol " << std::dec << (int) dist_symbol << std::endl;
+                    #endif
                     uint16_t distance = 0;
 
                     if (dist_symbol <= 3) {
@@ -240,8 +459,9 @@ std::vector<uint8_t> custom_inflate(const std::vector<uint8_t>& compressed_data)
                         // Use base distance and extra bits to calculate the distance
                         distance = distance_base[dist_symbol] + bitstream.read_bits(extra_bits);
                     }
-
+                    #ifdef DEBUG_INFLATE
                     std::cout << "match " << std::dec << (int) length << " " << (int) distance << std::dec << std::endl;
+                    #endif
                     size_t copy_pos = decompressed_data.size() - distance;
                     for (uint16_t i = 0; i < length; ++i) {
                         decompressed_data.push_back(decompressed_data[copy_pos++]);
@@ -313,28 +533,15 @@ unsigned long crc(unsigned char *buf, int len)
 }
 
 
-
-struct PNGChunk {
-    uint32_t length;
-    char type[5];
-    std::vector<uint8_t> data;
-    uint32_t crc;
-    uint32_t computed_crc;
-};
-
-struct PNGImage {
-    uint32_t width;
-    uint32_t height;
-    uint8_t bit_depth;
-    uint8_t color_type;
-    uint8_t compression_method;
-    uint8_t filter_method;
-    uint8_t interlace_method;
-    std::vector<PNGChunk> chunks;
+std::vector<uint8_t> build_image_data(const std::vector<PNGChunk> &chunks) {
     std::vector<uint8_t> image_data;
-    std::vector<uint8_t> decompressed_data;
-    std::vector<uint8_t> pixels;
-};
+    for (const auto &chunk : chunks) {
+        if (strcmp(chunk.type, "IDAT") == 0) {
+            image_data.insert(image_data.end(), chunk.data.begin(), chunk.data.end());
+        }
+    }
+    return image_data;
+}
 
 PNGImage parse_png(const std::string &filename) {
     std::ifstream file(filename, std::ios::binary);
@@ -398,10 +605,6 @@ PNGImage parse_png(const std::string &filename) {
             ihdr_parsed = true;
         }
 
-        if (strcmp(chunk.type, "IDAT") == 0) {
-            image.image_data.insert(image.image_data.end(), chunk.data.begin(), chunk.data.end());
-        }
-
         image.chunks.push_back(chunk);
 
         if (strcmp(chunk.type, "IEND") == 0)
@@ -413,6 +616,7 @@ PNGImage parse_png(const std::string &filename) {
         exit(1);
     }
 
+    image.image_data = build_image_data(image.chunks);
     return image;
 }
 
@@ -428,6 +632,19 @@ void print_chunk_details(const std::vector<PNGChunk> &chunks) {
         std::cout << std::dec << std::endl << std::endl;
     }
 }
+void print_packet_details(const std::vector<DeflatePacket> &packets) {
+    for (const auto &packet : packets) {
+        std::cout << "Packet details:\n" <<std::hex;
+        std::cout << "  Start Position: " << packet.start_position << "\n";
+        std::cout << "  Header Start: " << packet.header_start << "\n";
+        std::cout << "  Data Start: " << packet.data_start << "\n";
+        std::cout << "  End Position: " << packet.end_position << "\n";
+        std::cout << "  Block Type: " << packet.block_type << "\n";
+        std::cout << "  Last Block: " << (packet.last ? "Yes" : "No") << "\n";
+        std::cout << std::dec << std::endl;
+    }
+}
+
 
 std::vector<uint8_t> decompress_idat_data(const std::vector<uint8_t> &compressed_data) {
     return custom_inflate(compressed_data);
@@ -506,7 +723,9 @@ void reconstruct_image(PNGImage &image) {
         uint8_t filter_type = image.decompressed_data[pos++];
         std::copy(image.decompressed_data.begin() + pos, image.decompressed_data.begin() + pos + stride, current_scanline.begin());
         pos += stride;
+        #ifdef DEBUG_FILTERS
         std::cout << "Filter: " << (int) filter_type << std::endl;
+        #endif
 
         unfilter_scanline(filter_type, current_scanline, previous_scanline, bpp);
 
@@ -571,10 +790,14 @@ int main(int argc, char *argv[]) {
     write_raw_to_file(image.image_data, "compressed.bin");
 
     image.decompressed_data = decompress_idat_data(image.image_data);
+    puts("Decompressed!");
     write_raw_to_file(image.decompressed_data, "uncompressed.bin");
 
     reconstruct_image(image);
-
+    
+    std::vector<DeflatePacket> packets = header_scan(image.image_data);
+    std::cout << "Recovered " << packets.size() << " packets!" << std::endl;
+    print_packet_details(packets);
     save_as_ppm(image, "out.ppm");
 
     return 0;
