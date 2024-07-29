@@ -11,8 +11,251 @@ g++ png_mechanic.cpp -o png_mechanic -lz
 #include <cstdint>
 #include <cstring>
 #include <zlib.h>
+#include <bitset>
+#include <map>
 
 #undef DEBUG_CRC_INPUT
+
+class Bitstream {
+public:
+    Bitstream(const std::vector<uint8_t>& data) : data(data), bit_pos(0) {}
+
+    uint32_t read_bits(size_t count) {
+        uint32_t value = 0;
+        for (size_t i = 0; i < count; ++i) {
+            if (bit_pos >= data.size() * 8) {
+                std::cerr << "Error: Attempt to read past end of bitstream" << std::endl;
+                exit(1);
+            }
+            value |= (get_bit(bit_pos) << i);
+            bit_pos++;
+        }
+        return value;
+    }
+
+    void byte_align() {
+        bit_pos = (bit_pos + 7) & ~7;
+    }
+
+    const std::vector<uint8_t>& data;
+    size_t bit_pos;
+
+    uint8_t get_bit(size_t bit_pos) {
+        //std::cout << "Reading from " << bit_pos << std::endl;
+        //std::cout << "At byte " << std::hex << (int) data[bit_pos / 8] << std::dec << std::endl;
+        return (data[bit_pos / 8] >> ((bit_pos % 8))) & 1;
+    }
+};
+
+struct HuffmanTable {
+    std::vector<uint16_t> lengths;
+    std::map<uint32_t, uint16_t> codes;
+
+    HuffmanTable() = default;
+
+    HuffmanTable(const std::vector<uint16_t>& lengths) {
+        build(lengths);
+    }
+
+    void build(const std::vector<uint16_t>& lengths) {
+        this->lengths = lengths;
+        codes.clear();
+
+        std::vector<uint32_t> bl_count(16, 0);
+        for (auto len : lengths) {
+            if (len > 0) {
+                bl_count[len]++;
+            }
+        }
+
+        std::vector<uint32_t> next_code(16, 0);
+        uint32_t code = 0;
+        for (size_t bits = 1; bits <= 15; ++bits) {
+            code = (code + bl_count[bits - 1]) << 1;
+            next_code[bits] = code;
+        }
+
+        for (size_t n = 0; n < lengths.size(); ++n) {
+            uint16_t len = lengths[n];
+            if (len != 0) {
+                codes[next_code[len]] = n;
+                next_code[len]++;
+            }
+        }
+    }
+
+    uint16_t decode(Bitstream& stream) const {
+        uint32_t code = 0;
+        for (uint16_t len = 1; len <= 15; ++len) {
+            code |= stream.read_bits(1);
+            auto it = codes.find(code);
+            if (it != codes.end() && lengths[it->second] == len) {
+                return it->second;
+            }
+            code <<= 1;
+        }
+        std::cerr << "Error: Invalid Huffman code" << std::endl;
+        exit(1);
+    }
+};
+
+std::vector<uint8_t> custom_inflate(const std::vector<uint8_t>& compressed_data) {
+
+    // Read and verify zlib header
+    if (compressed_data.size() < 2) {
+        std::cerr << "Error: Data size is too small for zlib header" << std::endl;
+        exit(1);
+    }
+
+    uint16_t header = (compressed_data[0] | (compressed_data[1] << 8));
+    uint8_t cmf = header & 0xFF;
+    uint8_t flg = (header >> 8) & 0xFF;
+
+    if ((cmf * 256 + flg) % 31 != 0) {
+        std::cerr << "Error: Incorrect header check value" << std::endl;
+        exit(1);
+    }
+
+    if ((cmf & 0x0F) != 8) {
+        std::cerr << "Error: Unsupported compression method" << std::endl;
+        exit(1);
+    }
+
+    // Process compressed data blocks
+    Bitstream bitstream(compressed_data);
+    bitstream.read_bits(8); // Skip the CMF byte
+    bitstream.read_bits(8); // Skip the FLG byte
+    std::vector<uint8_t> decompressed_data;
+
+    bool last_block = false;
+    while (!last_block) {
+        last_block = bitstream.read_bits(1);
+        uint32_t block_type = bitstream.read_bits(2);
+
+        std::cerr << "Block type: " << block_type << std::endl;
+        if (block_type == 0) {
+            // Uncompressed block (not implemented in this example)
+            throw std::runtime_error("Uncompressed blocks are not supported in this example");
+        } else if (block_type == 1) {
+            // Fixed Huffman block (not implemented in this example)
+            throw std::runtime_error("Fixed Huffman blocks are not supported in this example");
+        }  else if (block_type == 2) {
+            // Dynamic Huffman block
+            uint16_t hlit = bitstream.read_bits(5) + 257;
+            uint16_t hdist = bitstream.read_bits(5) + 1;
+            uint16_t hclen = bitstream.read_bits(4) + 4;
+
+            std::vector<uint16_t> code_length_order = {16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15};
+            std::vector<uint16_t> code_lengths(19, 0);
+            for (size_t i = 0; i < hclen; ++i) {
+                code_lengths[code_length_order[i]] = bitstream.read_bits(3);
+            }
+
+            HuffmanTable code_length_table(code_lengths);
+            std::vector<uint16_t> literal_lengths;
+            std::vector<uint16_t> distance_lengths;
+
+            while (literal_lengths.size() < hlit) {
+                uint16_t symbol = code_length_table.decode(bitstream);
+                if (symbol < 16) {
+                    literal_lengths.push_back(symbol);
+                } else if (symbol == 16) {
+                    uint16_t repeat = bitstream.read_bits(2) + 3;
+                    literal_lengths.insert(literal_lengths.end(), repeat, literal_lengths.back());
+                } else if (symbol == 17) {
+                    uint16_t repeat = bitstream.read_bits(3) + 3;
+                    literal_lengths.insert(literal_lengths.end(), repeat, 0);
+                } else if (symbol == 18) {
+                    uint16_t repeat = bitstream.read_bits(7) + 11;
+                    literal_lengths.insert(literal_lengths.end(), repeat, 0);
+                }
+            }
+
+            while (distance_lengths.size() < hdist) {
+                uint16_t symbol = code_length_table.decode(bitstream);
+                if (symbol < 16) {
+                    distance_lengths.push_back(symbol);
+                } else if (symbol == 16) {
+                    uint16_t repeat = bitstream.read_bits(2) + 3;
+                    distance_lengths.insert(distance_lengths.end(), repeat, distance_lengths.back());
+                } else if (symbol == 17) {
+                    uint16_t repeat = bitstream.read_bits(3) + 3;
+                    distance_lengths.insert(distance_lengths.end(), repeat, 0);
+                } else if (symbol == 18) {
+                    uint16_t repeat = bitstream.read_bits(7) + 11;
+                    distance_lengths.insert(distance_lengths.end(), repeat, 0);
+                }
+            }
+
+            HuffmanTable literal_table(literal_lengths);
+            HuffmanTable distance_table(distance_lengths);
+
+            while (true) {
+                uint16_t symbol = literal_table.decode(bitstream);
+                std::cout << "Symbol " << std::hex << (int) symbol << std::dec << std::endl;
+                if (symbol < 256) {
+                    std::cout << "Hit literal " << std::hex << (int) symbol << std::dec << std::endl;
+                    decompressed_data.push_back(static_cast<uint8_t>(symbol));
+                } else if (symbol == 256) {
+                    std::cout << "Hit end of block symbol!" << std::endl;
+                    break;
+                } else {
+                    uint16_t length = 0;
+                    if (symbol <= 264) length = symbol - 257 + 3;
+                    else if (symbol <= 284) {
+                        const uint32_t length_base[28] = {
+                            3, 4, 5, 6, 7, 8, 9, 10,
+                            11, 13, 15, 17, 19, 23, 27, 31,
+                            35, 43, 51, 59, 67, 83, 99, 115,
+                            131, 163, 195, 227
+                        };
+                        uint32_t extra_bits = (symbol - 261) / 4;
+                        if (symbol < 261){
+                            extra_bits = 0;
+                        }
+                        uint32_t base_length = length_base[symbol - 257];
+                        length = base_length + bitstream.read_bits(extra_bits);
+                        std::cout << "Reading extra bits "  << (int) extra_bits << " with length base " << (int) base_length << std::endl;
+
+                    } else if (symbol == 285) length = 258;
+
+                    // Define base distances and extra bits length for distance symbols
+                    const uint16_t distance_base[30] = {
+                        1, 2, 3, 4, 5, 7, 9, 13,
+                        17, 25, 33, 49, 65, 97, 129, 193,
+                        257, 385, 513, 769, 1025, 1537, 2049, 3073, 
+                        4097, 6145, 8193, 12289, 16385, 24577
+                    };
+
+                    uint16_t dist_symbol = distance_table.decode(bitstream);
+                    std::cout << "Distance symbol " << std::dec << (int) dist_symbol << std::endl;
+                    uint16_t distance = 0;
+
+                    if (dist_symbol <= 3) {
+                        // Use base distance directly
+                        distance = dist_symbol + 1;
+                    } else {
+                        // Calculate the number of extra bits
+                        uint32_t extra_bits = (dist_symbol - 2) / 2;
+                        // Use base distance and extra bits to calculate the distance
+                        distance = distance_base[dist_symbol] + bitstream.read_bits(extra_bits);
+                    }
+
+                    std::cout << "match " << std::dec << (int) length << " " << (int) distance << std::dec << std::endl;
+                    size_t copy_pos = decompressed_data.size() - distance;
+                    for (uint16_t i = 0; i < length; ++i) {
+                        decompressed_data.push_back(decompressed_data[copy_pos++]);
+                    }
+                }
+            }
+        } else {
+            std::cerr << "Error: Invalid block type: " << block_type << std::endl;
+            exit(1);
+        }
+    }
+
+    return decompressed_data;
+}
 
 // CRC computation table for verifying chunk CRC values
 static unsigned long crc_table[256];
@@ -187,33 +430,7 @@ void print_chunk_details(const std::vector<PNGChunk> &chunks) {
 }
 
 std::vector<uint8_t> decompress_idat_data(const std::vector<uint8_t> &compressed_data) {
-    std::vector<uint8_t> decompressed_data;
-
-    z_stream stream;
-    memset(&stream, 0, sizeof(stream));
-    inflateInit(&stream);
-
-    stream.next_in = const_cast<Bytef *>(compressed_data.data());
-    stream.avail_in = compressed_data.size();
-
-    uint8_t buffer[4096];
-    do {
-        stream.next_out = buffer;
-        stream.avail_out = sizeof(buffer);
-
-        int res = inflate(&stream, Z_NO_FLUSH);
-        if (res == Z_STREAM_ERROR || res == Z_DATA_ERROR || res == Z_MEM_ERROR) {
-            std::cerr << "Error: Failed to decompress IDAT data." << std::endl;
-            inflateEnd(&stream);
-            //exit(1);
-        }
-
-        decompressed_data.insert(decompressed_data.end(), buffer, buffer + (sizeof(buffer) - stream.avail_out));
-    } while (stream.avail_out == 0);
-
-    inflateEnd(&stream);
-
-    return decompressed_data;
+    return custom_inflate(compressed_data);
 }
 
 void print_image_info(const PNGImage &image) {
@@ -289,6 +506,7 @@ void reconstruct_image(PNGImage &image) {
         uint8_t filter_type = image.decompressed_data[pos++];
         std::copy(image.decompressed_data.begin() + pos, image.decompressed_data.begin() + pos + stride, current_scanline.begin());
         pos += stride;
+        std::cout << "Filter: " << (int) filter_type << std::endl;
 
         unfilter_scanline(filter_type, current_scanline, previous_scanline, bpp);
 
@@ -330,6 +548,16 @@ void save_as_ppm(const PNGImage &image, const std::string &filename) {
         }
     }
 }
+
+void write_raw_to_file(const std::vector<uint8_t>& idat_data, const std::string& filename) {
+    std::ofstream file(filename, std::ios::binary);
+    if (!file.is_open()) {
+        std::cerr << "Error: Could not open file " << filename << std::endl;
+        exit(1);
+    }
+    file.write(reinterpret_cast<const char*>(idat_data.data()), idat_data.size());
+}
+
 int main(int argc, char *argv[]) {
     if (argc < 2) {
         std::cerr << "Usage: " << argv[0] << " <image.png>" << std::endl;
@@ -338,10 +566,12 @@ int main(int argc, char *argv[]) {
 
     std::string filename = argv[1];
     PNGImage image = parse_png(filename);
-    print_chunk_details(image.chunks);
+    //print_chunk_details(image.chunks);
     print_image_info(image);
+    write_raw_to_file(image.image_data, "compressed.bin");
 
     image.decompressed_data = decompress_idat_data(image.image_data);
+    write_raw_to_file(image.decompressed_data, "uncompressed.bin");
 
     reconstruct_image(image);
 
