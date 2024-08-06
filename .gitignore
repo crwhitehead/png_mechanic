@@ -1,3 +1,5 @@
 build/*
 corrupted_images/*
 repair_images/*
+test_images/*
+testing_base/*
