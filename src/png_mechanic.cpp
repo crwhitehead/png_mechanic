@@ -25,6 +25,7 @@ g++ png_mechanic.cpp -o png_mechanic -O3
 
 #include "utility.h"
 #include "png.h"
+#include "recovery.h"
 
 
 
@@ -686,7 +687,10 @@ int main(int argc, char *argv[]) {
     }
 
     PNGImage image = parse_png(filename);
-
+    RecoveryImage repaired = RecoveryImage(filename);
+    repaired.initialize_raw();
+    repaired.print_filter_statistics();
+    repaired.save_to_ppm("recovery.ppm");
     // Print PNG chunk details
     print_chunk_details(image.chunks);
 

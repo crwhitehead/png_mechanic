@@ -1,4 +1,7 @@
 #include <vector>
+#include <fstream>
+#include <iostream>
+#include <string>
 #include "utility.h"
 
 bool verifyLengths(const std::vector<uint16_t>& lengths){

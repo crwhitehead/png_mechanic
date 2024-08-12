@@ -51,7 +51,8 @@ public:
 
 bool verifyLengths(const std::vector<uint16_t>& lengths);
 
-struct HuffmanTable {
+class HuffmanTable {
+    public:
     std::vector<uint16_t> lengths;
     std::map<uint32_t, uint16_t> codes;
 
@@ -106,7 +107,8 @@ HuffmanTable load_code_lengths(Bitstream* bitstream, uint16_t hclen);
 HuffmanTable load_literal_lengths(Bitstream& bitstream, const HuffmanTable* code_length_table, uint16_t hlit);
 HuffmanTable load_distance_lengths(Bitstream& bitstream, const HuffmanTable* code_length_table, uint16_t hdist);
 
-struct DeflatePacket {
+class DeflatePacket {
+    public:
     size_t start_position;
     size_t header_start;
     size_t data_start;
@@ -124,9 +126,33 @@ struct DeflatePacket {
     DeflatePacket() = default;
 };
 
+class LZToken {
+    public:
+    uint8_t character;
+    size_t distance;
+    size_t length;
+    LZToken(uint8_t val){
+        this->character = val;
+        this->distance = 0;
+        this->length = 0;
+    }
+    LZToken(int distance, int length){
+        this->character = 0;
+        this->distance = distance;
+        this->length = length;
+    }
+    LZToken(){
+        this->character = 0;
+        this->distance = 0;
+        this->length = 0;
+    }
+};
+
 std::vector<DeflatePacket> header_scan(const std::vector<uint8_t>& compressed_data);
 
 std::vector<uint8_t> custom_inflate(const std::vector<uint8_t>& compressed_data);
+
+std::vector<LZToken> symbolic_inflate(const std::vector<uint8_t>& compressed_data, size_t start_position);
 
 void print_packet_details(const std::vector<DeflatePacket> &packets);
 

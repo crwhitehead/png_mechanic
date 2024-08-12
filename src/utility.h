@@ -3,6 +3,7 @@
 
 #include <vector>
 #include <cstdint>
+#include <string>
 
 bool verifyLengths(const std::vector<uint16_t>& lengths);
 

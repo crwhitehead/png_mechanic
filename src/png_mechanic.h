@@ -49,12 +49,4 @@ struct uncertainByte {
 };
 
 
-//TODO: This!
-class RecoveryImage {
-public:
-    RecoveryImage() {
-        
-    }    
-};
-
 #endif
