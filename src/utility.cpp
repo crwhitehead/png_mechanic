@@ -75,3 +75,27 @@ void write_raw_to_file(const std::vector<uint8_t>& idat_data, const std::string&
     }
     file.write(reinterpret_cast<const char*>(idat_data.data()), idat_data.size());
 }
+
+std::vector<uint8_t> read_file_to_vector(const std::string& filename) {
+    // Open the file in binary mode and move the file pointer to the end
+    std::ifstream file(filename, std::ios::binary | std::ios::ate);
+    
+    if (!file.is_open()) {
+        throw std::runtime_error("Could not open file: " + filename);
+    }
+
+    // Get the size of the file
+    std::streamsize size = file.tellg();
+    file.seekg(0, std::ios::beg);
+
+    // Prepare a vector to hold the file contents
+    std::vector<uint8_t> buffer(size);
+
+    // Read the file contents into the vector
+    if (!file.read(reinterpret_cast<char*>(buffer.data()), size)) {
+        throw std::runtime_error("Failed to read file: " + filename);
+    }
+
+    // Return the vector containing the file's bytes
+    return buffer;
+}

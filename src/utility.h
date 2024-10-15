@@ -20,5 +20,6 @@ unsigned long update_crc(unsigned long crc, unsigned char *buf,
                        
 unsigned long crc(unsigned char *buf, int len);
 
+std::vector<uint8_t> read_file_to_vector(const std::string& filename);
 
 #endif

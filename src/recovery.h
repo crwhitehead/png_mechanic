@@ -17,10 +17,31 @@ public:
     RecoveryByteType variant;
     std::vector<uint8_t> possible;
     std::vector<RecoveryByte*> reliant_bytes;
+    uint32_t offset;
     RecoveryByte* referenced;
 
     RecoveryByte();
     RecoveryByte(uint8_t val);
+    uint8_t getValue(){
+        if(variant == reference_byte){
+            if(referenced == NULL || referenced == this){
+                throw std::runtime_error("Bad reference");
+            }
+            return referenced->getValue();
+        } else {
+            return value;
+        }
+    }
+    void setValue(uint8_t val){
+        if(variant == reference_byte){
+            if(referenced == NULL || referenced == this){
+                throw std::runtime_error("Bad reference");
+            }
+            referenced->setValue(val);
+        } else {
+            value = val;
+        }
+    }
 };
 
 class Pixel {
@@ -59,6 +80,16 @@ private:
     double calculate_row_distance(const RecoveryImage& img, uint32_t y1, uint32_t y2) const;
 };
 
+struct RecoveryChunk {
+    std::string chunk_type;               // The type of the PNG chunk (e.g., "IHDR", "IDAT")
+    std::vector<uint8_t> chunk_data;      // The actual data within the chunk
+    uint32_t start_location;              // The start location of the chunk in the data vector
+    bool crc_corrupted;                   // Flag indicating if the CRC is corrupted
+    bool invalid_chunk_end;               // Flag indicating if the end of the chunk does not align with a new valid chunk
+    bool overlaps_other_chunks;           // Flag indicating if the chunk overlaps with another detected chunk
+    bool length_out_of_bounds;            // Flag indicating if the chunk length goes outside the length of the original data vector
+};
+
 class RecoveryImage {
 public:
     uint32_t width, height;
@@ -66,7 +97,7 @@ public:
     uint64_t score;
     uint32_t bpp, stride;
     PNGImage base;
-    std::vector<PNGChunk> chunks;
+    std::vector<RecoveryChunk> chunks;
     std::vector<RecoveryPacket> packets;
     RecoveryByte* raw_data;
     uint8_t* scan_data;
@@ -74,15 +105,18 @@ public:
     std::vector<std::unique_ptr<Heuristic>> heuristics;
     std::set<uint32_t> scan_updates;
     std::set<uint32_t> pixel_updates;
+    std::set<uint32_t> repair_spots;
 
     RecoveryImage(const std::string& filename);
     ~RecoveryImage();
     void initialize_raw(); // Function to initialize raw values from DeflatePackets
+    void initialize_smart(); // Function to initialize raw values from DeflatePackets
     void save_to_ppm(const std::string& filename); // Function to save the image to a PPM file
     void initialize_heuristics();
     void recalculate_heuristics();
     void modify_pixel(uint32_t offset, Pixel val);
     uint64_t total_score() const;
+    size_t raw_data_size();
     void simplify_backreferences();
     ScanlineType get_scanline_type(uint32_t location);
     void modify_raw(uint32_t offset, uint8_t val);
@@ -94,7 +128,7 @@ public:
     void flag_all_for_update(); // Flag all scanlines and pixels for updating
     void process_updates();     // Process all flagged scanline and pixel updates
     void print_filter_statistics() const; // Print statistics on PNG filters used
-
+    void load_packets();
 
 private:
     void apply_filter_none(uint32_t scanline_index, uint32_t byte_offset);
@@ -105,6 +139,15 @@ private:
     uint8_t paeth_predict(uint8_t a, uint8_t b, uint8_t c);
     Pixel extract_pixel(uint32_t x, uint32_t y);
 };
+
+bool is_valid_chunk_type(const std::vector<uint8_t>& type);
+
+// Function to convert bytes to a 32-bit unsigned integer (big-endian)
+uint32_t bytes_to_uint32(const std::vector<uint8_t>& data, size_t start);
+
+// Function to scan for PNG chunk headers, validate CRC, and ensure valid sequence
+std::vector<RecoveryChunk> scan_png_headers(std::vector<uint8_t>& data);
+void print_recovery_chunks(const std::vector<RecoveryChunk>& chunks);
 
 #endif // RECOVERY_H
 

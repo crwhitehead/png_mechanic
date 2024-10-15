@@ -10,7 +10,6 @@ g++ png_mechanic.cpp -o png_mechanic -O3
 #include <vector>
 #include <cstdint>
 #include <cstring>
-#include <zlib.h>
 #include <bitset>
 #include <map>
 #include <unordered_map>
@@ -63,14 +62,14 @@ std::vector<uncertainByte> inflatePacket(DeflatePacket &packet, std::vector<uint
         throw std::runtime_error("Bad lengths in code length!");
         
     }
-    packet.literal_table = load_literal_lengths(bitstream, &packet.code_length_table, hlit);
-    packet.distance_table = load_distance_lengths(bitstream,&packet.code_length_table, hdist);
+    packet.literal_table = load_literal_lengths(&bitstream, &packet.code_length_table, hlit);
+    packet.distance_table = load_distance_lengths(&bitstream,&packet.code_length_table, hdist);
     
     while (true) {
         if(bitstream.finished()){
             break;
         }
-        uint16_t symbol = packet.literal_table.decode(bitstream);
+        uint16_t symbol = packet.literal_table.decode(&bitstream);
         packet.literal_map[symbol]++;
         #ifdef DEBUG_INFLATE
         std::cout << "Symbol " << std::hex << (int) symbol << std::dec << std::endl;
@@ -115,7 +114,7 @@ std::vector<uncertainByte> inflatePacket(DeflatePacket &packet, std::vector<uint
                 4097, 6145, 8193, 12289, 16385, 24577
             };
 
-            uint16_t dist_symbol = packet.distance_table.decode(bitstream);
+            uint16_t dist_symbol = packet.distance_table.decode(&bitstream);
             packet.distance_map[dist_symbol]++;
             #ifdef DEBUG_INFLATE
             std::cout << "Distance symbol " << std::dec << (int) dist_symbol << std::endl;
@@ -639,7 +638,7 @@ void recover(PNGImage &image){
     
 }
 
-int main(int argc, char *argv[]) {
+int main_old(int argc, char *argv[]) {
     if (argc < 2) {
         std::cerr << "Usage: " << argv[0] << " <image.png> [options]\n";
         std::cerr << "Options:\n";
@@ -688,11 +687,11 @@ int main(int argc, char *argv[]) {
 
     PNGImage image = parse_png(filename);
     RecoveryImage repaired = RecoveryImage(filename);
-    repaired.initialize_raw();
+    repaired.initialize_smart();
     repaired.print_filter_statistics();
-    repaired.save_to_ppm("recovery.ppm");
+    //repaired.save_to_ppm("recovery.ppm");
     // Print PNG chunk details
-    print_chunk_details(image.chunks);
+    //print_chunk_details(image.chunks);
 
     // Print image info
     print_image_info(image);
@@ -722,6 +721,100 @@ int main(int argc, char *argv[]) {
         image.decompressed_data = custom_inflate(image.image_data);
         reconstruct_image(image);
         save_as_ppm(image, output_ppm);
+    }
+
+    return 0;
+}
+
+int main(int argc, char *argv[]) {
+    if (argc < 2) {
+        std::cerr << "Usage: " << argv[0] << " <image.png> [options]\n";
+        std::cerr << "Options:\n";
+        std::cerr << "  -o <filename>     Output PPM file\n";
+        std::cerr << "  -p                Perfect(ish) recovery\n";
+        std::cerr << "  -s                Generate statistics\n";
+        std::cerr << "  -d                Use dumb recovery\n";
+        std::cerr << "  -c <filename>     Output compressed data to file\n";
+        std::cerr << "  -r <filename>     Output recovered image to PPM file\n";
+        return 1;
+    }
+
+    std::string filename = argv[1];
+    std::string output_ppm = "out.ppm";
+    std::string compressed_output = "compressed.bin";
+    std::string repair_output = "fixed.ppm";
+    bool generate_statistics = false;
+    bool output_ppm_flag = false;
+    bool repair_flag = false;
+    bool output_compressed_flag = false;
+    bool dumb_recovery_flag = false;
+
+    MEDIAN_PASSES = 10000000;
+    SMOOTH_PASSES = 10;
+    SMOOTH_LOOPS = 1;
+    for (int i = 2; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "-o" && i + 1 < argc) {
+            output_ppm = argv[++i];
+            output_ppm_flag = true;
+        } else if (arg == "-s") {
+            generate_statistics = true;
+        } else if (arg == "-p") {
+            MEDIAN_PASSES = 10000000;
+            SMOOTH_PASSES = 1000;
+            SMOOTH_LOOPS = 5;
+        } else if (arg == "-c" && i + 1 < argc) {
+            compressed_output = argv[++i];
+            output_compressed_flag = true;
+        }  else if (arg == "-r" && i + 1 < argc) {
+            repair_output = argv[++i];
+            repair_flag = true;
+        }  else if (arg == "-d") {
+            dumb_recovery_flag = true;
+        } else {
+            std::cerr << "Unknown option: " << arg << "\n";
+            return 1;
+        }
+    }
+
+    //PNGImage image = parse_png(filename);
+    RecoveryImage repaired = RecoveryImage(filename);
+    if(dumb_recovery_flag){
+        repaired.initialize_raw();
+    } else {
+        repaired.initialize_smart();
+    }
+    repaired.print_filter_statistics();
+    //repaired.save_to_ppm("recovery.ppm");
+    // Print PNG chunk details
+    //print_chunk_details(image.chunks);
+
+    // Print image info
+    //print_image_info(image);
+    /*
+    // Write the raw IDAT data to a file if requested
+    if (output_compressed_flag) {
+        write_raw_to_file(image.image_data, compressed_output);
+    }
+
+
+    // Generate statistics if requested
+    if (generate_statistics) {
+        std::vector<DeflatePacket> packets = header_scan(image.image_data);
+        std::cout << "Recovered " << packets.size() << " packets!" << std::endl;
+        print_packet_details(packets);
+    }
+    // Generate statistics if requested
+    if (repair_flag) {
+        puts("Starting repair");
+        std::cout << repair_output << std::endl;
+        recover(image);
+        save_as_ppm(image, repair_output);
+    }
+    */
+    // Reconstruct image and save as PPM if requested
+    if (output_ppm_flag) {
+        repaired.save_to_ppm(output_ppm);
     }
 
     return 0;

@@ -16,7 +16,7 @@ def corrupt_image(image_data, corruption_size, start_position):
 def main():
     input_dir = 'test_images'
     output_dir = 'corrupted_images'
-    num_corruptions = 100
+    num_corruptions = 10
 
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)

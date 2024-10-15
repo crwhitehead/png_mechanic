@@ -7,11 +7,14 @@
 #include <unordered_map>
 #include <map>
 #include <stdexcept>
+#include <string>
 
 
 class Bitstream {
 public:
-    Bitstream(const std::vector<uint8_t>& data) : data(data), bit_pos(0) {}
+    Bitstream(const std::vector<uint8_t>& data_original) : bit_pos(0) {
+        this->data = data_original;
+    }
 
     uint32_t read_bits(size_t count) {
         uint32_t value = 0;
@@ -34,7 +37,7 @@ public:
         bit_pos = (bit_pos + 7) & ~7;
     }
 
-    const std::vector<uint8_t>& data;
+    std::vector<uint8_t> data;
     size_t bit_pos;
 
     uint8_t get_bit(size_t bit_pos) {
@@ -89,10 +92,10 @@ class HuffmanTable {
         }
     }
 
-    uint16_t decode(Bitstream& stream) const {
+    uint16_t decode(Bitstream* stream) const {
         uint32_t code = 0;
         for (uint16_t len = 1; len <= 15; ++len) {
-            code |= stream.read_bits(1);
+            code |= stream->read_bits(1);
             auto it = codes.find(code);
             if (it != codes.end() && lengths[it->second] == len) {
                 return it->second;
@@ -104,8 +107,29 @@ class HuffmanTable {
 };
 
 HuffmanTable load_code_lengths(Bitstream* bitstream, uint16_t hclen);
-HuffmanTable load_literal_lengths(Bitstream& bitstream, const HuffmanTable* code_length_table, uint16_t hlit);
-HuffmanTable load_distance_lengths(Bitstream& bitstream, const HuffmanTable* code_length_table, uint16_t hdist);
+HuffmanTable load_literal_lengths(Bitstream* bitstream, const HuffmanTable* code_length_table, uint16_t hlit);
+HuffmanTable load_distance_lengths(Bitstream* bitstream, const HuffmanTable* code_length_table, uint16_t hdist);
+
+class LZToken {
+public:
+    uint8_t character;
+    size_t distance;
+    size_t length;
+
+    // Constructors
+    LZToken(uint8_t val) : character(val), distance(0), length(0) {}
+    LZToken(int distance, int length) : character(0), distance(distance), length(length) {}
+    LZToken() : character(0), distance(0), length(0) {}
+
+    // String conversion function
+    std::string to_string() const {
+        if (distance == 0 && length == 0) {
+            return "Literal: '" + std::to_string(character) + "'";
+        } else {
+            return "Reference: {Distance: " + std::to_string(distance) + ", Length: " + std::to_string(length) + "}";
+        }
+    }
+};
 
 class DeflatePacket {
     public:
@@ -114,6 +138,7 @@ class DeflatePacket {
     size_t data_start;
     size_t end_position;
     size_t block_type;
+    size_t lz_blocks;
     bool last;
     bool safe;
     Bitstream* bitstream;
@@ -124,35 +149,13 @@ class DeflatePacket {
     std::unordered_map<uint16_t, size_t> distance_map;
     
     DeflatePacket() = default;
-};
-
-class LZToken {
-    public:
-    uint8_t character;
-    size_t distance;
-    size_t length;
-    LZToken(uint8_t val){
-        this->character = val;
-        this->distance = 0;
-        this->length = 0;
-    }
-    LZToken(int distance, int length){
-        this->character = 0;
-        this->distance = distance;
-        this->length = length;
-    }
-    LZToken(){
-        this->character = 0;
-        this->distance = 0;
-        this->length = 0;
-    }
+    std::vector<LZToken> symbolic_inflate();
 };
 
 std::vector<DeflatePacket> header_scan(const std::vector<uint8_t>& compressed_data);
 
 std::vector<uint8_t> custom_inflate(const std::vector<uint8_t>& compressed_data);
 
-std::vector<LZToken> symbolic_inflate(const std::vector<uint8_t>& compressed_data, size_t start_position);
 
 void print_packet_details(const std::vector<DeflatePacket> &packets);
 

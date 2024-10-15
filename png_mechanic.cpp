@@ -18,85 +18,8 @@ g++ png_mechanic.cpp -o png_mechanic -O3
 #include <algorithm>
 #include <numeric>
 #include <cmath>
+#include "png_mechanic.h"
 
-#undef DEBUG_CRC_INPUT
-#undef DEBUG_INFLATE
-#undef DEBUG_FILTERS
-#define DEBUG_PACKET_LOCATIONS 1
-
-
-struct uncertainByte {
-    uint8_t value;
-    uint8_t* foundValue;
-    int32_t reference;
-    bool found;
-    bool testing;
-    uncertainByte() {
-        this->value = 0;
-        this->reference = 0;
-        this->found = false;
-        this->testing = false;
-        this->foundValue = 0;
-    }
-    uncertainByte(uint8_t value, int32_t reference, bool found) {
-        this->value = value;
-        this->reference = reference;
-        this->found = found;
-        this->testing = false;
-        this->foundValue = 0;
-    }
-    uint8_t getValue(){
-        if(this->foundValue == 0){
-            return *this->foundValue;
-        } else {
-            return this->value;
-        }
-    }
-};
-
-size_t MEDIAN_PASSES = 0;
-size_t SMOOTH_PASSES = 0;
-size_t SMOOTH_LOOPS = 0;
-
-class Bitstream {
-public:
-    Bitstream(const std::vector<uint8_t>& data) : data(data), bit_pos(0) {}
-
-    uint32_t read_bits(size_t count) {
-        uint32_t value = 0;
-        for (size_t i = 0; i < count; ++i) {
-            if (bit_pos >= data.size() * 8) {
-                //std::cerr << "Error: Attempt to read past end of bitstream" << std::endl;
-            } else {
-                value |= (get_bit(bit_pos) << i);
-                bit_pos++;
-            }
-        }
-        return value;
-    }
-
-    void set_pos(size_t pos){
-        bit_pos = pos;
-    }
-
-    void byte_align() {
-        bit_pos = (bit_pos + 7) & ~7;
-    }
-
-    const std::vector<uint8_t>& data;
-    size_t bit_pos;
-
-    uint8_t get_bit(size_t bit_pos) {
-        //std::cout << "Reading from " << bit_pos << std::endl;
-        //std::cout << "At byte " << std::hex << (int) data[bit_pos / 8] << std::dec << std::endl;
-        return (data[bit_pos / 8] >> ((bit_pos % 8))) & 1;
-    }
-    bool finished() {
-        //std::cout << "Reading from " << bit_pos << std::endl;
-        //std::cout << "At byte " << std::hex << (int) data[bit_pos / 8] << std::dec << std::endl;
-        return bit_pos >= data.size() * 8;
-    }
-};
     
 bool verifyLengths(const std::vector<uint16_t>& lengths){
     unsigned long total = 0;
@@ -107,391 +30,6 @@ bool verifyLengths(const std::vector<uint16_t>& lengths){
     }
     //printf("%p\n", total);
     return total == 0x100000;
-}
-
-
-struct HuffmanTable {
-    std::vector<uint16_t> lengths;
-    std::map<uint32_t, uint16_t> codes;
-
-    HuffmanTable() = default;
-
-    HuffmanTable(const std::vector<uint16_t>& lengths) {
-        build(lengths);
-    }
-
-    void build(const std::vector<uint16_t>& lengths) {
-        this->lengths = lengths;
-        codes.clear();
-
-        std::vector<uint32_t> bl_count(16, 0);
-        for (auto len : lengths) {
-            if (len > 0) {
-                bl_count[len]++;
-            }
-        }
-
-        std::vector<uint32_t> next_code(16, 0);
-        uint32_t code = 0;
-        for (size_t bits = 1; bits <= 15; ++bits) {
-            code = (code + bl_count[bits - 1]) << 1;
-            next_code[bits] = code;
-        }
-
-        for (size_t n = 0; n < lengths.size(); ++n) {
-            uint16_t len = lengths[n];
-            if (len != 0) {
-                codes[next_code[len]] = n;
-                next_code[len]++;
-            }
-        }
-    }
-
-    uint16_t decode(Bitstream& stream) const {
-        uint32_t code = 0;
-        for (uint16_t len = 1; len <= 15; ++len) {
-            code |= stream.read_bits(1);
-            auto it = codes.find(code);
-            if (it != codes.end() && lengths[it->second] == len) {
-                return it->second;
-            }
-            code <<= 1;
-        }
-        throw std::runtime_error("Invalid Huffman code");
-    }
-};
-
-struct DeflatePacket {
-    size_t start_position;
-    size_t header_start;
-    size_t data_start;
-    size_t end_position;
-    size_t block_type;
-    bool last;
-    bool safe;
-    Bitstream* bitstream;
-    HuffmanTable literal_table;
-    HuffmanTable code_length_table;
-    HuffmanTable distance_table;
-    std::unordered_map<uint16_t, size_t> literal_map;
-    std::unordered_map<uint16_t, size_t> distance_map;
-    
-    DeflatePacket() = default;
-};
-
-struct PNGChunk {
-    uint32_t length;
-    char type[5];
-    std::vector<uint8_t> data;
-    uint32_t crc;
-    uint32_t computed_crc;
-};
-
-struct PNGImage {
-    uint32_t width;
-    uint32_t height;
-    uint8_t bit_depth;
-    uint8_t color_type;
-    uint8_t compression_method;
-    uint8_t filter_method;
-    uint8_t interlace_method;
-    std::vector<PNGChunk> chunks;
-    std::vector<DeflatePacket> packets;
-    std::vector<uint8_t> image_data;
-    std::vector<uint8_t> decompressed_data;
-    std::vector<uint8_t> pixels;
-};
-
-HuffmanTable load_code_lengths(Bitstream* bitstream, uint16_t hclen){
-    std::vector<uint16_t> code_length_order = {16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15};
-    std::vector<uint16_t> code_lengths(19, 0);
-    for (size_t i = 0; i < hclen; ++i) {
-        if(bitstream->finished()){
-            break;
-        }
-        code_lengths[code_length_order[i]] = bitstream->read_bits(3);
-    }
-
-    HuffmanTable code_length_table(code_lengths);
-    return code_length_table;
-}
-HuffmanTable load_literal_lengths(Bitstream& bitstream, const HuffmanTable* code_length_table, uint16_t hlit){
-    std::vector<uint16_t> literal_lengths;
-
-    while (literal_lengths.size() < hlit) {
-        if(bitstream.finished()){
-            break;
-        }
-        uint16_t symbol = code_length_table->decode(bitstream);
-        if (symbol < 16) {
-            literal_lengths.push_back(symbol);
-        } else if (symbol == 16 && literal_lengths.size() > 0) {
-            uint16_t repeat = bitstream.read_bits(2) + 3;
-            literal_lengths.insert(literal_lengths.end(), repeat, literal_lengths.back());
-        } else if (symbol == 17) {
-            uint16_t repeat = bitstream.read_bits(3) + 3;
-            literal_lengths.insert(literal_lengths.end(), repeat, 0);
-        } else if (symbol == 18) {
-            uint16_t repeat = bitstream.read_bits(7) + 11;
-            literal_lengths.insert(literal_lengths.end(), repeat, 0);
-        }
-    }
-    HuffmanTable literal_table(literal_lengths);
-    return literal_table;
-}
-HuffmanTable load_distance_lengths(Bitstream& bitstream, const HuffmanTable* code_length_table, uint16_t hdist){
-    std::vector<uint16_t> distance_lengths;
-    while (distance_lengths.size() < hdist) {
-        if(bitstream.finished()){
-            break;
-        }
-        uint16_t symbol = code_length_table->decode(bitstream);
-        if (symbol < 16) {
-            distance_lengths.push_back(symbol);
-        } else if (symbol == 16 && distance_lengths.size() > 0) {
-            uint16_t repeat = bitstream.read_bits(2) + 3;
-            distance_lengths.insert(distance_lengths.end(), repeat, distance_lengths.back());
-        } else if (symbol == 17) {
-            uint16_t repeat = bitstream.read_bits(3) + 3;
-            distance_lengths.insert(distance_lengths.end(), repeat, 0);
-        } else if (symbol == 18) {
-            uint16_t repeat = bitstream.read_bits(7) + 11;
-            distance_lengths.insert(distance_lengths.end(), repeat, 0);
-        }
-    }
-    HuffmanTable distance_table(distance_lengths);
-    return distance_table;
-}
-
-std::vector<DeflatePacket> header_scan(const std::vector<uint8_t>& compressed_data){
-        // Read and verify zlib header
-    // Process compressed data blocks
-    Bitstream bitstream(compressed_data);
-    std::vector<DeflatePacket> packets;
-    
-    for(size_t i=0; i<compressed_data.size()*8; i++){
-        bitstream.set_pos(i);
-        //std::cout << (int) i << std::endl;
-        DeflatePacket test_packet;
-        test_packet.start_position = i;
-        test_packet.last = 1 == bitstream.read_bits(1);
-        test_packet.block_type = bitstream.read_bits(2);
-        test_packet.header_start = bitstream.bit_pos;
-        test_packet.safe = true;
-        if (test_packet.block_type == 2) {
-            // Dynamic Huffman block
-            uint16_t hlit = bitstream.read_bits(5) + 257;
-            uint16_t hdist = bitstream.read_bits(5) + 1;
-            uint16_t hclen = bitstream.read_bits(4) + 4;
-            HuffmanTable code_length_table = load_code_lengths(&bitstream, hclen);
-            if(!verifyLengths(code_length_table.lengths)){
-                //std::cout << "Bad lengths in code length!" << std::endl;
-                continue;
-            }
-            HuffmanTable literal_table = load_literal_lengths(bitstream, &code_length_table, hlit);
-            HuffmanTable distance_table = load_distance_lengths(bitstream,&code_length_table, hdist);
-            /*
-            Time to check if we have a valid huffman tree!
-            */
-            if(!verifyLengths(literal_table.lengths) || !verifyLengths(distance_table.lengths)){
-                //std::cout << "Bad lengths!" << std::endl;
-                continue;
-            }
-            test_packet.data_start = bitstream.bit_pos;
-
-            /*
-            Now read til the end...
-            */
-            bool safe_end = false;
-            while (true) {
-                if(bitstream.finished()){
-                    break;
-                }
-                uint16_t symbol = literal_table.decode(bitstream);
-                if (symbol < 256) {
-                } else if (symbol == 256) {
-                    safe_end = true;
-                    break;
-                } else {
-                    uint16_t length = 0;
-                    if (symbol <= 264) length = symbol - 257 + 3;
-                    else if (symbol <= 284) {
-                        uint32_t extra_bits = (symbol - 261) / 4;
-                        if (symbol < 261){
-                            extra_bits = 0;
-                        }
-                        bitstream.read_bits(extra_bits);
-                    } else if (symbol == 285) length = 258;
-
-                    uint16_t dist_symbol = distance_table.decode(bitstream);
-
-                    if (dist_symbol <= 3) {
-                    } else {
-                        // Calculate the number of extra bits
-                        uint32_t extra_bits = (dist_symbol - 2) / 2;
-                        // Use base distance and extra bits to calculate the distance
-                        bitstream.read_bits(extra_bits);
-                    }
-                }
-            }
-            test_packet.end_position = bitstream.bit_pos;
-            test_packet.bitstream = 0;
-            if(safe_end){
-                packets.push_back(test_packet);
-            }
-        } else {
-            continue;
-        }
-    }
-
-    return packets;
-}
-
-
-std::vector<uint8_t> custom_inflate(const std::vector<uint8_t>& compressed_data) {
-
-    // Read and verify zlib header
-    if (compressed_data.size() < 2) {
-        std::cerr << "Error: Data size is too small for zlib header" << std::endl;
-        exit(1);
-    }
-
-    uint16_t header = (compressed_data[0] | (compressed_data[1] << 8));
-    uint8_t cmf = header & 0xFF;
-    uint8_t flg = (header >> 8) & 0xFF;
-
-    if ((cmf * 256 + flg) % 31 != 0) {
-        std::cerr << "Error: Incorrect header check value" << std::endl;
-        exit(1);
-    }
-
-    if ((cmf & 0x0F) != 8) {
-        std::cerr << "Error: Unsupported compression method" << std::endl;
-        exit(1);
-    }
-
-    // Process compressed data blocks
-    Bitstream bitstream(compressed_data);
-    bitstream.read_bits(8); // Skip the CMF byte
-    bitstream.read_bits(8); // Skip the FLG byte
-    std::vector<uint8_t> decompressed_data;
-
-    bool last_block = false;
-    while (!last_block) {
-        if(bitstream.finished()){
-            break;
-        }
-        last_block = bitstream.read_bits(1);
-        uint32_t block_type = bitstream.read_bits(2);
-
-        #ifdef DEBUG_INFLATE
-        std::cerr << "Block type " << block_type << std::endl;
-        #endif
-        #ifdef DEBUG_PACKET_LOCATIONS
-        std::cout << "Packet: " << std::hex << bitstream.bit_pos - 3 << std::dec << ", type " << block_type << ", end " << last_block << std::endl;
-        #endif
-        if (block_type == 0) {
-            // Uncompressed block (not implemented in this example)
-            continue;
-            throw std::runtime_error("Uncompressed blocks are not supported in this example");
-        } else if (block_type == 1) {
-            // Fixed Huffman block (not implemented in this example)
-            continue;
-            throw std::runtime_error("Fixed Huffman blocks are not supported in this example");
-        }  else if (block_type == 2) {
-            // Dynamic Huffman block
-            uint16_t hlit = bitstream.read_bits(5) + 257;
-            uint16_t hdist = bitstream.read_bits(5) + 1;
-            uint16_t hclen = bitstream.read_bits(4) + 4;
-
-            
-            HuffmanTable code_length_table = load_code_lengths(&bitstream, hclen);
-            if(!verifyLengths(code_length_table.lengths)){
-                //std::cout << "Bad lengths in code length!" << std::endl;
-                continue;
-            }
-            HuffmanTable literal_table = load_literal_lengths(bitstream, &code_length_table, hlit);
-            HuffmanTable distance_table = load_distance_lengths(bitstream,&code_length_table, hdist);
-            while (true) {
-                if(bitstream.finished()){
-                    break;
-                }
-                uint16_t symbol = literal_table.decode(bitstream);
-                #ifdef DEBUG_INFLATE
-                std::cout << "Symbol " << std::hex << (int) symbol << std::dec << std::endl;
-                #endif
-                if (symbol < 256) {
-                    #ifdef DEBUG_INFLATE
-                    std::cout << "Hit literal " << std::hex << (int) symbol << std::dec << std::endl;
-                    #endif
-                    decompressed_data.push_back(static_cast<uint8_t>(symbol));
-                } else if (symbol == 256) {
-                    #ifdef DEBUG_INFLATE
-                    std::cout << "Hit end of block symbol!" << std::endl;
-                    #endif
-                    break;
-                } else {
-                    uint16_t length = 0;
-                    if (symbol <= 264) length = symbol - 257 + 3;
-                    else if (symbol <= 284) {
-                        const uint32_t length_base[28] = {
-                            3, 4, 5, 6, 7, 8, 9, 10,
-                            11, 13, 15, 17, 19, 23, 27, 31,
-                            35, 43, 51, 59, 67, 83, 99, 115,
-                            131, 163, 195, 227
-                        };
-                        uint32_t extra_bits = (symbol - 261) / 4;
-                        if (symbol < 261){
-                            extra_bits = 0;
-                        }
-                        uint32_t base_length = length_base[symbol - 257];
-                        length = base_length + bitstream.read_bits(extra_bits);
-                        #ifdef DEBUG_INFLATE
-                        std::cout << "Reading extra bits "  << (int) extra_bits << " with length base " << (int) base_length << std::endl;
-                        #endif
-
-                    } else if (symbol == 285) length = 258;
-
-                    // Define base distances and extra bits length for distance symbols
-                    const uint16_t distance_base[30] = {
-                        1, 2, 3, 4, 5, 7, 9, 13,
-                        17, 25, 33, 49, 65, 97, 129, 193,
-                        257, 385, 513, 769, 1025, 1537, 2049, 3073, 
-                        4097, 6145, 8193, 12289, 16385, 24577
-                    };
-
-                    uint16_t dist_symbol = distance_table.decode(bitstream);
-                    #ifdef DEBUG_INFLATE
-                    std::cout << "Distance symbol " << std::dec << (int) dist_symbol << std::endl;
-                    #endif
-                    uint16_t distance = 0;
-
-                    if (dist_symbol <= 3) {
-                        // Use base distance directly
-                        distance = dist_symbol + 1;
-                    } else {
-                        // Calculate the number of extra bits
-                        uint32_t extra_bits = (dist_symbol - 2) / 2;
-                        // Use base distance and extra bits to calculate the distance
-                        distance = distance_base[dist_symbol] + bitstream.read_bits(extra_bits);
-                    }
-                    #ifdef DEBUG_INFLATE
-                    std::cout << "match " << std::dec << (int) length << " " << (int) distance << std::dec << std::endl;
-                    #endif
-                    size_t copy_pos = decompressed_data.size() - distance;
-                    for (uint16_t i = 0; i < length; ++i) {
-                        decompressed_data.push_back(decompressed_data[copy_pos++]);
-                    }
-                }
-            }
-        } else {
-            continue;
-            std::cerr << "Error: Invalid block type: " << block_type << std::endl;
-            exit(1);
-        }
-    }
-
-    return decompressed_data;
 }
 
 // CRC computation table for verifying chunk CRC values
@@ -1038,30 +576,81 @@ static inline double scoreUncertainty(PNGImage &image, std::vector<uncertainByte
     std::vector<uint8_t> old_scanline(stride, 0);
     std::vector<uint8_t> previous_scanline(stride, 0);
     std::vector<uint8_t> current_scanline(stride);
-    std::vector<double> scores;
-    double total_score;
+    uint32_t old_certainty = 0;
+    uint32_t previous_certainty = 0;
+    uint32_t current_certainty = 0;
+    std::vector<std::pair<double, uint32_t>> scores;
+    double total_score = 0;
+    double total_weight = 0;
+    std::unordered_map<uint64_t, double> color_freq_goal;
+    double total_goal;
+    std::unordered_map<uint64_t, double> color_freq_actual;
+    double total_actual;
+    
     size_t pos = 0;
+    bool end_of_safe = false;
     for (uint32_t y = 0; y < image.height; ++y) {
         uint8_t filter_type = data[pos++];
         std::copy(data.begin() + pos, data.begin() + pos + stride, current_scanline.begin());
         pos += stride;
 
         unfilter_scanline(filter_type, current_scanline, previous_scanline, bpp);
+        current_certainty = 0;
+        for(int n=y*real_stride; n<(y+1)*real_stride; n++){
+            current_certainty += uncertain_data[n].found;
+        }
+        for(int n=y*real_stride+1; n<(y+1)*real_stride; n+=bpp){
+            uint64_t color = 0;
+            size_t certainty = 0;
+            for(int q=0; q<bpp; q++){
+                color += (data[n+q]/8) << (q*8);
+                certainty += uncertain_data[n+q].found;
+            }
+            if(certainty == bpp && !end_of_safe){
+                color_freq_goal[color] += 1.0;
+                total_goal += 1.0;
+            } else {
+                end_of_safe = true;
+            }
+            color_freq_actual[color] += 1.0;
+            total_actual += 1.0;
+            
+        }
+        if(end_of_safe){
+            current_certainty /= 5.0;
+        }
         if(y>1){
-            scores.push_back(euclidean_distance(previous_scanline, current_scanline));
-            total_score += scores.back();
+            scores.push_back(std::pair<double, uint32_t>(euclidean_distance(previous_scanline, current_scanline), previous_certainty+current_certainty));
+            total_score += scores.back().first * ((float) scores.back().second);
+            total_weight += scores.back().second;
+            std::vector<uint8_t> left(current_scanline.end() - current_scanline.size()+bpp, current_scanline.end());
+            std::vector<uint8_t> right(current_scanline.end() - current_scanline.size(), current_scanline.end()-bpp);
+            scores.push_back(std::pair<double, uint32_t>(euclidean_distance(left, right), current_certainty));
+            total_score += scores.back().first * ((float) scores.back().second);
+            total_weight += scores.back().second;
         }
         old_scanline = previous_scanline;
         previous_scanline = current_scanline;
+        old_certainty = previous_certainty;
+        current_certainty = current_certainty;
     }
-    double mean = total_score / scores.size();
+    double mean = total_score / total_weight;
     double real_score = 0;
     //std::cout << "START-----------------------" << std::endl;
-    for(double val : scores){
+    for(auto val : scores){
         //std::cout << val << " - " << mean << std::endl;
-        real_score += std::abs(val-mean);
-        //std::cout << real_score << std::endl;
+        real_score += std::abs(val.first-mean)*(real_stride-val.second);
     }
+    double color_score = 1.0;
+    for(auto& val : color_freq_actual){
+        //std::cout << val << std::endl;
+        double occurence = color_freq_actual[val.first] / total_actual;
+        double expected = color_freq_goal[val.first] / total_goal;
+        double rating = std::abs(occurence - expected) / (occurence + expected);
+        color_score += rating;
+    }
+    real_score *= color_score+10.0;
+    //std::cout << "COLOR SCORE " << color_score << " : " << real_score << std::endl;
     //std::cout << "END--------------" << std::endl;
     return real_score;
     return score;
@@ -1165,6 +754,33 @@ void medianUncertain(PNGImage &image, std::vector<uncertainByte> &data){
     }
 }
 
+void attempt_modification(PNGImage &image, double* goal_score, std::vector<size_t> &modified, std::vector<uncertainByte> &data, uint8_t max_scale){
+    uint8_t scale = max_scale;
+    while(scale > 0){
+        //std::cout << "Value: "<< current << std::endl;
+        for(int attempt=-scale; attempt <= scale; attempt+=scale*2){
+            for(auto val: modified){
+                data[val].value += attempt;
+            }
+            auto result = scoreUncertainty(image, data);
+            if(result < *goal_score || *goal_score != *goal_score){
+                std::cout << result << " < " << *goal_score << std::endl;
+                *goal_score = result;
+                std::cout << "Improved! " << *goal_score << " at scale " << (int) scale << std::endl;
+                reconstruct_data(image, make_certain(data));
+                if(smooth_ppms >= 0){
+                    save_as_ppm(image, "post_smooth_" + std::to_string(++smooth_ppms) + ".ppm");
+                }
+                smooth_ppms++;
+            } else {
+                for(auto val: modified){
+                    data[val].value -= attempt;
+                }
+            }
+        }
+        scale /= 2;
+    }
+}
 
 void smoothUncertainty(PNGImage &image, std::vector<uncertainByte> &data){
     uint32_t bpp = (image.bit_depth / 8) * (image.color_type == 2 ? 3 : (image.color_type == 6 ? 4 : 1));
@@ -1182,31 +798,30 @@ void smoothUncertainty(PNGImage &image, std::vector<uncertainByte> &data){
     medianUncertain(image, data);
     reconstruct_data(image, make_certain(data));
     save_as_ppm(image, "post_median.ppm");
-    int smooth_ppms = 0;
     for(int loop=0; loop<SMOOTH_LOOPS; loop++){
         auto current = scoreUncertainty(image, data);
         int processed = 0;
-        for(auto index: guessable){
-            uint8_t scale = 128;
-            while(scale > 0){
-                std::cout << "Value: "<< current << std::endl;
-                std::cout << processed << "/" << guessable.size() << std::endl;
-                for(int attempt=-scale; attempt <= scale; attempt+=scale*2){
-                    uint8_t original = data[index.first].value;
-                    data[index.first].value += attempt;
-                    auto result = scoreUncertainty(image, data);
-                    if(result < current || current != current){
-                        std::cout << result << " < " << current << std::endl;
-                        current = result;
-                        std::cout << "Improved! " << current << " at scale " << (int) scale << " loop # " << loop << std::endl;
-                        reconstruct_data(image, make_certain(data));
-                        save_as_ppm(image, "post_smooth_" + std::to_string(++smooth_ppms) + ".ppm");
-                    } else {
-                        data[index.first].value = original;
+        for(int y=0;y<image.height; y++){
+            const int segment_size = 64;
+            for(int x_segment = 1; x_segment<real_stride; x_segment+=segment_size){
+                std::vector<size_t> modified;
+                for(int x=x_segment;x<real_stride && x < x_segment+segment_size;x++){
+                    size_t loc = x+y*real_stride;
+                    if(!data[loc].found && data[loc].reference == 0){
+                        modified.push_back(loc);
                     }
                 }
-                scale /= 2;
+                if(modified.size() > 0){
+                    attempt_modification(image, &current, modified, data, 128);
+                }
             }
+            std::cout << "Done with line " << y << " of " << image.height << " on loop " << loop << std::endl;
+        }
+        for(auto &index: guessable){
+            std::cout << processed << "/" << guessable.size() << std::endl;
+            std::vector<size_t> modified;
+            modified.push_back(index.first);
+            attempt_modification(image, &current, modified, data, 128);
             processed++;
             if(processed > SMOOTH_PASSES){
                 break;
@@ -1227,28 +842,15 @@ std::vector<uncertainByte> get_uncertain_bytes(PNGImage &image){
     int up_offset = 0;
     for(int n=0; n<image.packets.size(); n++){
         if(!image.packets[n].safe){
-            /*std::vector<uncertainByte> loaded = inflatePacket(image.packets[n], image.image_data);
+            /*
+            std::vector<uncertainByte> loaded = inflatePacket(image.packets[n], image.image_data);
             int good = 0;
-            for(; good<loaded.size(); good++){
-                if((good+up_offset) % real_stride == 0){
-                    if(loaded[good].reference < -good){
-                        loaded[good].value = data[up_offset+good+loaded[good].reference].value;
-                    } else {
-                        loaded[good].value = loaded[good+loaded[good].reference].value;
-                    }
-                    if(loaded[good].value != data[up_offset-(up_offset%real_stride)].value && loaded[good].value != data[up_offset-(up_offset%real_stride)-real_stride].value){
-                        std::cout << "BAD!" << std::endl;
-                        break;
-                    }
-                }
+            int full_row = (up_offset / real_stride) - 1;
+            if (row < 0){
+                break;
             }
-            std::cout << "good?" << std::endl;
-            std::cout << good << std::endl;
-            int safety = 3 * real_stride;
-            for(int i=0; i<good-safety; i++){
-                data[up_offset] = loaded[i];
-                up_offset++;
-            }*/
+            int original_up = up_offset;
+            uint8_t so_far = make_certain(data);*/
             break;
         } else {
             std::vector<uncertainByte> loaded = inflatePacket(image.packets[n], image.image_data);
@@ -1384,8 +986,8 @@ int main(int argc, char *argv[]) {
             generate_statistics = true;
         } else if (arg == "-p") {
             MEDIAN_PASSES = 10000000;
-            SMOOTH_PASSES = 50;
-            SMOOTH_LOOPS = 2;
+            SMOOTH_PASSES = 1000;
+            SMOOTH_LOOPS = 5;
         } else if (arg == "-c" && i + 1 < argc) {
             compressed_output = argv[++i];
             output_compressed_flag = true;
