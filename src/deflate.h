@@ -139,6 +139,7 @@ class DeflatePacket {
     size_t end_position;
     size_t block_type;
     size_t lz_blocks;
+    size_t byte_length;
     bool last;
     bool safe;
     Bitstream* bitstream;

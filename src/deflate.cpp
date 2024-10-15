@@ -307,6 +307,7 @@ void print_packet_details(const std::vector<DeflatePacket>& packets) {
               << std::setw(7) << "Last"
               << std::setw(7) << "Safe"
               << std::setw(10) << "LZ Blocks"
+              << std::setw(10) << "Byte len"
               << std::endl;
 
     std::cout << std::string(81, '-') << std::endl;
@@ -320,12 +321,14 @@ void print_packet_details(const std::vector<DeflatePacket>& packets) {
                   << std::setw(7) << (packet.last ? "Yes" : "No")
                   << std::setw(7) << (packet.safe ? "Yes" : "No")
                   << std::setw(10) << packet.lz_blocks
+                  << std::setw(10) << packet.byte_length
                   << std::endl;
     }
 }
 
 std::vector<LZToken> DeflatePacket::symbolic_inflate() {
     Bitstream* bitstream = this->bitstream;
+    this->byte_length = 0;
     bitstream->set_pos(this->start_position);
     std::vector<LZToken> tokens;
     //std::cout << "Look!2 " << bitstream->size() << std::endl;
@@ -357,6 +360,7 @@ std::vector<LZToken> DeflatePacket::symbolic_inflate() {
             uint16_t symbol = literal_table.decode(bitstream);
             if (symbol < 256) {
                 tokens.push_back(LZToken(static_cast<uint8_t>(symbol)));
+                this->byte_length+=1;
             } else if (symbol == 256) {
                 break;
             } else {
@@ -399,6 +403,7 @@ std::vector<LZToken> DeflatePacket::symbolic_inflate() {
                     distance = distance_base[dist_symbol] +  bitstream->read_bits(extra_bits);
                 }
                 tokens.push_back(LZToken(distance, length));
+                this->byte_length+=length;
             }
         }
     } else {

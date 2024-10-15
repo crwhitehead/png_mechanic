@@ -189,12 +189,15 @@ void RecoveryImage::modify_scanline(uint32_t offset, uint8_t val) {
 }
 
 void RecoveryImage::flag_modified_scanline(uint32_t offset) {
-    this->pixel_updates.insert(offset);
+    uint32_t scanline_index = offset / (this->stride + 1);
+    uint32_t byte_offset = offset % (this->stride + 1);
+    uint32_t pixel_x = byte_offset / bpp;
+    this->pixel_updates.insert(scanline_index*this->width + pixel_x);
 }
 
 
 void RecoveryImage::update_scanlines() {
-
+    //If we modify the scanline_type determiner, flag the whole scanline for reprocessing.
     for (const auto& offset : scan_updates) {
         uint32_t scanline_index = offset / (this->stride + 1);
         uint32_t byte_offset = offset % (this->stride + 1);
@@ -208,9 +211,14 @@ void RecoveryImage::update_scanlines() {
     for (const auto& offset : scan_updates) {
         uint32_t scanline_index = offset / (this->stride + 1);
         uint32_t byte_offset = offset % (this->stride + 1);
-        if(byte_offset == 0){
+        if(scanline_index >= this->height){
             continue;
         }
+        /* This breaks image loading. I don't know why.
+        if(byte_offset == 0){
+            continue;
+        } */
+        uint8_t before = this->scan_data[scanline_index * this->stride + byte_offset];
         switch (get_scanline_type(offset)) {
             case ScanlineNone:
                 apply_filter_none(scanline_index, byte_offset);
@@ -233,6 +241,13 @@ void RecoveryImage::update_scanlines() {
                 //std::cerr << "Invalid scanline type, defaulting to none!" << std::endl;
                 apply_filter_none(scanline_index, byte_offset);
                 break;
+        }
+        uint8_t after = this->scan_data[scanline_index * this->stride + byte_offset];
+        if(before != after){
+            this->flag_modified_scanline(offset);
+            this->scan_updates.insert(offset+1);
+            this->scan_updates.insert(offset+1+this->stride+1);
+            this->scan_updates.insert(offset+this->stride+1);
         }
         //printf("Updating scanline %d:%d for %d from %d!\n", scanline_index, byte_offset, (int) this->scan_data[scanline_index * this->stride + byte_offset], (int) this->raw_data[offset].value);
     }
@@ -364,7 +379,8 @@ void RecoveryImage::initialize_smart(){
     // and each `RecoveryPacket` contains a vector of bytes representing decompressed data.
     
     uint32_t positive_offset = 0;
-    for (auto& packet: this->packets) {
+    for (int i=0; i< this->packets.size(); i++) {
+        DeflatePacket packet = this->packets[i];
         if(packet.safe){
             std::vector<LZToken> data = packet.symbolic_inflate();
             for(LZToken& token : data){
@@ -388,7 +404,43 @@ void RecoveryImage::initialize_smart(){
             std::cout << "Too far!" << std::endl;
             break;
         }
+        std::cout << " DOne : " << positive_offset << std::endl;
     }
+    
+    /* Now from the back */
+    
+    
+    positive_offset = this->raw_data_size();
+    for (int i=this->packets.size()-1; i>=0; i--) {
+        DeflatePacket packet = this->packets[i];
+        if(packet.safe){
+            std::vector<LZToken> data = packet.symbolic_inflate();
+            positive_offset -= packet.byte_length;
+            uint32_t temp_length = positive_offset;
+            for(LZToken& token : data){
+                //std::cout << token.to_string() << std::endl;
+                if(token.distance == 0){
+                    raw_data[positive_offset].value = token.character;
+                    raw_data[positive_offset].variant = fixed_byte;
+                    ++positive_offset;
+                } else {
+                    for(int i=0; i<token.length; i++){
+                        raw_data[positive_offset].referenced = &raw_data[positive_offset-token.distance];
+                        raw_data[positive_offset].variant = reference_byte;
+                        ++positive_offset;
+                    }
+                }
+            }
+            positive_offset = temp_length;
+        } else {
+            break;
+        }
+        if(positive_offset < 0){
+            std::cout << "Too far down!" << std::endl;
+            break;
+        }
+    }
+    
     this->simplify_backreferences();
     this->flag_all_for_update();
     this->process_updates();
@@ -449,7 +501,7 @@ void RecoveryImage::flag_all_for_update() {
 
     // Flag all pixels for updating
     for (uint32_t pixel = 0; pixel < width * height; ++pixel) {
-        pixel_updates.insert(pixel);
+        //pixel_updates.insert(pixel);
     }
 }
 
